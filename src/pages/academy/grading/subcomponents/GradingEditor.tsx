@@ -4,7 +4,6 @@ import {
   Divider,
   H3,
   Icon,
-  IconName,
   Intent,
   NumericInput,
   Position,
@@ -12,13 +11,11 @@ import {
 } from '@blueprintjs/core';
 import { IconNames } from '@blueprintjs/icons';
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import ReactMde, { ReactMdeProps } from 'react-mde';
 import { AutogradingResult, LLMPrompt } from 'src/commons/assessment/AssessmentTypes';
 import { useTokens, useTypedDispatch, useTypedSelector } from 'src/commons/utils/Hooks';
 
 import SessionActions from '../../../../commons/application/actions/SessionActions';
 import ControlButton from '../../../../commons/ControlButton';
-import Markdown from '../../../../commons/Markdown';
 import { Prompt } from '../../../../commons/ReactRouterPrompt';
 import { postGenerateComments, saveChosenComments } from '../../../../commons/sagas/RequestsSaga';
 import { getPrettyDate } from '../../../../commons/utils/DateHelper';
@@ -74,6 +71,7 @@ const GradingEditor: React.FC<Props> = props => {
   const hasPrompts = prompts.length > 0;
   const gradingSaveResult = useTypedSelector(state => state.session.gradingSaveResult);
   const lastSavedSelectionKeyRef = useRef<string>(EMPTY_SELECTION_SAVE_KEY);
+  const initialComposedCommentRef = useRef<string>(props.comments);
   const saveInFlightRef = useRef<boolean>(false);
   const saveAndContinueTimeoutRef = useRef<number | undefined>(undefined);
   const saveTimeoutRef = useRef<number | undefined>(undefined);
@@ -102,14 +100,6 @@ const GradingEditor: React.FC<Props> = props => {
     props.xpAdjustment.toString()
   );
   /**
-   * The text in the react-mde editor, that will be saved
-   * to a comment displayed below the numerical XP */
-  const [editorValue, setEditorValue] = useState(props.comments);
-  /**
-   * The selected tab for the react-mde editor (either 'write' or 'preview')
-   */
-  const [selectedTab, setSelectedTab] = useState<ReactMdeProps['selectedTab']>('write');
-  /**
    * Determines whether the 'You have unsaved changes'
    * prompt should appear on page navigation, to prevent the
    * 'Save and Continue' button from activating the prompt
@@ -122,6 +112,9 @@ const GradingEditor: React.FC<Props> = props => {
    */
   const [currentlySaving, setCurrentlySaving] = useState(false);
   const [isSaveInFlight, setIsSaveInFlight] = useState(false);
+  const [userComment, setUserComment] = useState<string>(props.comments);
+  const [aiCommentDrafts, setAiCommentDrafts] = useState<Record<number, string>>({});
+  const [editorText, setEditorText] = useState<string>(props.comments);
 
   useEffect(() => {
     makeInitialState();
@@ -170,105 +163,132 @@ const GradingEditor: React.FC<Props> = props => {
     }
   }, [gradingSaveResult, props.questionId, props.submissionId]);
 
-  // Invisible delimiters used internally to preserve per-comment editing state
-  // without showing any marker text in the editor.
-  const COMMENT_SEPARATOR = '\n\u2063\u2063\n';
-  const SECTION_MARKER = '\n\u2064\u2064\n';
-
-  /**
-   * Splits the editor value into the user's freeform text (above the marker)
-   * and the generated-comments block (below the marker).
-   */
-  const splitEditor = (value: string): { userText: string; commentsBlock: string } => {
-    const markerIdx = value.indexOf(SECTION_MARKER);
-    if (markerIdx === -1) {
-      return { userText: value, commentsBlock: '' };
-    }
-    return {
-      userText: value.slice(0, markerIdx),
-      commentsBlock: value.slice(markerIdx + SECTION_MARKER.length)
-    };
-  };
-
-  /**
-   * Joins the user freeform text and the generated-comments block back together.
-   * If there are no selected comments the marker is omitted so the editor stays clean.
-   */
-  const joinEditor = (userText: string, commentsBlock: string): string => {
-    if (!commentsBlock) return userText;
-    return userText + SECTION_MARKER + commentsBlock;
-  };
-
-  const buildCommentsBlock = (indices: number[], texts: Record<number, string>) => {
-    return (
-      [...indices]
-        .sort((a, b) => a - b)
-        // Preserve one block segment per selected index, including empty edits,
-        // so split/join order always stays aligned with sorted selected indices.
-        .map(i => texts[i] ?? '')
-        .join(COMMENT_SEPARATOR)
-    );
-  };
-
-  /**
-   * Parses the current comments block back into per-comment texts so that
-   * user edits made directly in the editor are preserved.
-   */
-  const syncCommentsBlock = (
-    commentsBlock: string,
+  const buildAiTextMap = (
     indices: number[],
-    currentTexts: Record<number, string>
+    drafts: Record<number, string>
   ): Record<number, string> => {
-    const sorted = [...indices].sort((a, b) => a - b);
-    if (sorted.length === 0) return { ...currentTexts };
-    const parts = commentsBlock.split(COMMENT_SEPARATOR);
-    const updated = { ...currentTexts };
-
-    sorted.forEach((idx, i) => {
-      if (i < parts.length) {
-        updated[idx] = parts[i];
+    const map: Record<number, string> = {};
+    indices.forEach(index => {
+      const draft = drafts[index];
+      if (draft !== undefined) {
+        map[index] = draft;
       }
     });
+    return map;
+  };
 
-    // If user added extra separators, fold remainder into the last comment
-    if (parts.length > sorted.length && sorted.length > 0) {
-      const lastIdx = sorted[sorted.length - 1];
-      updated[lastIdx] = parts.slice(sorted.length - 1).join(COMMENT_SEPARATOR);
+  const composeFinalCommentText = (
+    nextUserComment: string,
+    indices: number[],
+    drafts: Record<number, string>,
+    baseSuggestions: string[]
+  ): string => {
+    const sections: string[] = [];
+
+    if (nextUserComment.trim().length > 0) {
+      sections.push(nextUserComment);
     }
 
-    return updated;
+    [...indices]
+      .sort((a, b) => a - b)
+      .forEach(index => {
+        const text = drafts[index] ?? baseSuggestions[index] ?? '';
+        if (text.trim().length > 0) {
+          sections.push(text);
+        }
+      });
+
+    return sections.join('\n\n');
+  };
+
+  const handleEditorTextChange = (newText: string) => {
+    setEditorText(newText);
+
+    const sorted = [...selectedIndices].sort((a, b) => a - b);
+    if (sorted.length === 0) {
+      setUserComment(newText);
+      return;
+    }
+
+    const currentAiSections = sorted
+      .map(idx => aiCommentDrafts[idx] ?? suggestions[idx] ?? '')
+      .filter(section => section.trim().length > 0);
+    const currentAiSuffix = currentAiSections.join('\n\n');
+
+    // Fast path: if current AI suffix is untouched, only user comment changed.
+    if (currentAiSuffix && newText.endsWith(currentAiSuffix)) {
+      const userPart = newText.slice(0, -1 * currentAiSuffix.length).replace(/\n+$/, '');
+      setUserComment(userPart);
+      return;
+    }
+
+    // Fallback: parse by paragraph boundaries (2 or more newlines), preserving existing drafts
+    // when parsing is ambiguous.
+    const parts = newText.split(/\n{2,}/);
+    if (parts.length < sorted.length + 1) {
+      setUserComment(newText);
+      return;
+    }
+
+    const aiStart = Math.max(0, parts.length - sorted.length);
+    const userText = parts.slice(0, aiStart).join('\n\n');
+    const aiParts = parts.slice(aiStart);
+
+    setUserComment(userText);
+    setAiCommentDrafts(prev => {
+      const next = { ...prev };
+      sorted.forEach((idx, i) => {
+        next[idx] = aiParts[i] ?? next[idx] ?? suggestions[idx] ?? '';
+      });
+      return next;
+    });
   };
 
   const onToggleComment = (index: number) => {
     const isDeselecting = selectedIndices.includes(index);
-    const { userText, commentsBlock } = splitEditor(editorValue);
-
-    // Sync current comments block back to per-comment texts
-    const synced =
-      selectedIndices.length > 0
-        ? syncCommentsBlock(commentsBlock, selectedIndices, commentTexts)
-        : { ...commentTexts };
 
     if (isDeselecting) {
-      const newTexts = { ...synced };
-      const newIndices = selectedIndices.filter(i => i !== index);
-      setCommentTexts(newTexts);
-      setSelectedIndices(newIndices);
-      setEditorValue(joinEditor(userText, buildCommentsBlock(newIndices, newTexts)));
-    } else {
-      const newTexts = { ...synced };
-      if (newTexts[index] === undefined) {
-        newTexts[index] = suggestions[index];
-      }
-      const newIndices = [...selectedIndices, index];
-      setCommentTexts(newTexts);
-      setSelectedIndices(newIndices);
-      setEditorValue(joinEditor(userText, buildCommentsBlock(newIndices, newTexts)));
+      const nextIndices = selectedIndices.filter(i => i !== index).sort((a, b) => a - b);
+      setSelectedIndices(nextIndices);
+      setEditorText(
+        composeFinalCommentText(userComment, nextIndices, aiCommentDrafts, suggestions)
+      );
+      return;
     }
+
+    const nextIndices = [...selectedIndices, index].sort((a, b) => a - b);
+    setSelectedIndices(nextIndices);
+    setAiCommentDrafts(prev => {
+      const nextDrafts = { ...prev };
+      if (nextDrafts[index] === undefined) {
+        nextDrafts[index] = suggestions[index] ?? '';
+      }
+
+      setEditorText(composeFinalCommentText(userComment, nextIndices, nextDrafts, suggestions));
+      return nextDrafts;
+    });
   };
 
-  const stripInternalMarkers = (value: string): string => {
-    return value.replaceAll(SECTION_MARKER, '\n').replaceAll(COMMENT_SEPARATOR, '\n');
+  const buildSelectionSaveKey = (
+    indices: number[],
+    texts: Record<number, string>,
+    originals: string[]
+  ): string => {
+    const sortedSelectedIndices = [...indices].sort((a, b) => a - b);
+    const changedEdits: Record<number, string> = {};
+
+    sortedSelectedIndices.forEach(idx => {
+      const original = originals[idx] ?? '';
+      const edited = texts[idx] ?? original;
+      if (edited !== original) {
+        changedEdits[idx] = edited;
+      }
+    });
+
+    return JSON.stringify({
+      selected_indices: sortedSelectedIndices,
+      edits: changedEdits
+    });
   };
 
   const postSaveChosenComments = async (): Promise<boolean> => {
@@ -277,13 +297,7 @@ const GradingEditor: React.FC<Props> = props => {
       return true;
     }
 
-    const { commentsBlock } = splitEditor(editorValue);
-    const synced =
-      selectedIndices.length > 0
-        ? syncCommentsBlock(commentsBlock, selectedIndices, commentTexts)
-        : { ...commentTexts };
-
-    setCommentTexts(synced);
+    const aiTextMap = buildAiTextMap(selectedIndices, aiCommentDrafts);
 
     const sortedSelectedIndices = [...selectedIndices].sort((a, b) => a - b);
 
@@ -291,16 +305,17 @@ const GradingEditor: React.FC<Props> = props => {
     const changedEdits: Record<number, string> = {};
     sortedSelectedIndices.forEach(idx => {
       const original = suggestions[idx] ?? '';
-      const edited = synced[idx] ?? original;
+      const edited = aiTextMap[idx] ?? original;
       if (edited !== original) {
-        changedEdits[idx] = stripInternalMarkers(edited);
+        changedEdits[idx] = edited;
       }
     });
 
-    const currentSelectionKey = JSON.stringify({
-      selected_indices: sortedSelectedIndices,
-      edits: changedEdits
-    });
+    const currentSelectionKey = buildSelectionSaveKey(
+      sortedSelectedIndices,
+      aiTextMap,
+      suggestions
+    );
 
     // Avoid rewriting identical selection state on repeated saves.
     if (currentSelectionKey === lastSavedSelectionKeyRef.current) {
@@ -326,35 +341,30 @@ const GradingEditor: React.FC<Props> = props => {
 
   const [suggestions, setSuggestions] = useState<string[]>([]);
   const [selectedIndices, setSelectedIndices] = useState<number[]>([]);
-  const [commentTexts, setCommentTexts] = useState<Record<number, string>>({});
   const [hasClickedGenerate, setHasClickedGenerate] = useState<boolean>(false);
   const [isViewLLMPromptOpen, setIsViewLLMPromptOpen] = useState<boolean>(false);
   const [hasGenerated, setHasGenerated] = useState<boolean>(false); //If generate comments button has been pressed
 
-  const restoreUserText = (savedComments: string, selectedTexts: string[]): string => {
+  const deriveUserCommentText = (savedComments: string, selectedTexts: string[]): string => {
     const normalizedSavedComments = savedComments.replace(/\r\n/g, '\n');
 
     if (selectedTexts.length === 0) {
       return normalizedSavedComments;
     }
 
-    // Support both historical storage formats:
-    // 1) comments joined by single newlines
-    // 2) comments joined by double newlines
-    const candidateBlocks = [selectedTexts.join('\n'), selectedTexts.join('\n\n')].filter(Boolean);
+    const joinedSingle = selectedTexts.join('\n');
+    const joinedDouble = selectedTexts.join('\n\n');
 
-    for (const block of candidateBlocks) {
-      if (normalizedSavedComments === block) {
-        return '';
-      }
+    if (normalizedSavedComments === joinedSingle || normalizedSavedComments === joinedDouble) {
+      return '';
+    }
 
-      if (normalizedSavedComments.endsWith(`\n${block}`)) {
-        return normalizedSavedComments.slice(0, -1 * (block.length + 1));
-      }
+    if (joinedSingle && normalizedSavedComments.endsWith(`\n${joinedSingle}`)) {
+      return normalizedSavedComments.slice(0, -1 * (joinedSingle.length + 1));
+    }
 
-      if (normalizedSavedComments.endsWith(`\n\n${block}`)) {
-        return normalizedSavedComments.slice(0, -1 * (block.length + 2));
-      }
+    if (joinedDouble && normalizedSavedComments.endsWith(`\n\n${joinedDouble}`)) {
+      return normalizedSavedComments.slice(0, -1 * (joinedDouble.length + 2));
     }
 
     return normalizedSavedComments;
@@ -362,7 +372,6 @@ const GradingEditor: React.FC<Props> = props => {
 
   const makeInitialState = () => {
     setXpAdjustmentInput(props.xpAdjustment.toString());
-    setSelectedTab('write');
     setCurrentlySaving(false);
     // Load existing AI comments from props (the database)
     const existingComments = props.ai_comments?.comments || [];
@@ -378,33 +387,33 @@ const GradingEditor: React.FC<Props> = props => {
       hydratedCommentTexts[index] = persistedSelectedEdits[index] ?? existingComments[index] ?? '';
     });
 
-    const selectedTexts = validSelectedIndices.map(index => hydratedCommentTexts[index] || '');
-    const restoredUserText = restoreUserText(props.comments, selectedTexts);
-    const restoredCommentsBlock = buildCommentsBlock(validSelectedIndices, hydratedCommentTexts);
+    const selectedTexts = validSelectedIndices.map(index => hydratedCommentTexts[index] ?? '');
+    const restoredUserText = deriveUserCommentText(props.comments, selectedTexts);
+    const restoredEditorText = composeFinalCommentText(
+      restoredUserText,
+      validSelectedIndices,
+      hydratedCommentTexts,
+      existingComments
+    );
 
-    setEditorValue(joinEditor(restoredUserText, restoredCommentsBlock));
+    setUserComment(restoredUserText);
+    setAiCommentDrafts(hydratedCommentTexts);
+    setEditorText(restoredEditorText);
+    initialComposedCommentRef.current = restoredEditorText;
     setSuggestions(existingComments);
     // Lock the button if we already have comments for this submission
     setHasGenerated(existingComments.length > 0);
     setSelectedIndices(validSelectedIndices);
-    setCommentTexts(hydratedCommentTexts);
-    lastSavedSelectionKeyRef.current = EMPTY_SELECTION_SAVE_KEY;
+    lastSavedSelectionKeyRef.current = buildSelectionSaveKey(
+      validSelectedIndices,
+      hydratedCommentTexts,
+      existingComments
+    );
     if (saveAndContinueTimeoutRef.current !== undefined) {
       window.clearTimeout(saveAndContinueTimeoutRef.current);
       saveAndContinueTimeoutRef.current = undefined;
     }
   };
-
-  /**
-   * A custom icons provider. It uses a bulky mapping function
-   * defined below.
-   *
-   * See {@link https://github.com/andrerpena/react-mde}
-   */
-  function blueprintIconProvider(name: string) {
-    const blueprintIcon = mdeToBlueprintIconMapping(name);
-    return <Icon icon={blueprintIcon.iconName} htmlTitle={blueprintIcon.title} />;
-  }
 
   /**
    * Makes sure that the XP values are permissible before
@@ -428,7 +437,12 @@ const GradingEditor: React.FC<Props> = props => {
         return;
       }
 
-      const cleanedEditorValue = stripInternalMarkers(editorValue);
+      const cleanedEditorValue = composeFinalCommentText(
+        userComment,
+        selectedIndices,
+        aiCommentDrafts,
+        suggestions
+      );
 
       saveInFlightRef.current = true;
       setIsSaveInFlight(true);
@@ -542,24 +556,21 @@ const GradingEditor: React.FC<Props> = props => {
 
   const checkHasUnsavedChanges = () => {
     const newXpAdjustmentInput = convertParamToInt(xpAdjustmentInput || undefined);
-    const normalizedEditorValue = stripInternalMarkers(editorValue);
-    return props.xpAdjustment !== newXpAdjustmentInput || props.comments !== normalizedEditorValue;
+    const normalizedEditorValue = composeFinalCommentText(
+      userComment,
+      selectedIndices,
+      aiCommentDrafts,
+      suggestions
+    );
+    return (
+      props.xpAdjustment !== newXpAdjustmentInput ||
+      initialComposedCommentRef.current !== normalizedEditorValue
+    );
   };
 
   const checkIsNewQuestion = () => {
     return props.gradedAt === undefined;
   };
-
-  const generateMarkdownPreview = (markdown: string) =>
-    Promise.resolve(
-      <Markdown
-        content={markdown}
-        simplifiedAutoLink
-        strikethrough
-        tasklists
-        openLinksInNewWindow
-      />
-    );
 
   const copyComposedPromptToClipboard = () => {
     navigator.clipboard.writeText(
@@ -593,8 +604,6 @@ const GradingEditor: React.FC<Props> = props => {
     disabled: isSaveInFlight,
     className: gradingEditorButtonClass
   };
-  const onTabChange = (tab: ReactMdeProps['selectedTab']) => setSelectedTab(tab);
-
   // Derived values
   const totalXp = props.initialXp + (convertParamToInt(xpAdjustmentInput || undefined) || 0);
   const xpPlaceholder = `${props.initialXp > 0 ? '-' : ''}${props.initialXp} to ${
@@ -628,7 +637,15 @@ const GradingEditor: React.FC<Props> = props => {
         setSuggestions(resp.comments);
         setHasGenerated(true);
         setSelectedIndices([]);
-        setCommentTexts({});
+        setAiCommentDrafts({});
+        setEditorText(userComment);
+        initialComposedCommentRef.current = composeFinalCommentText(
+          userComment,
+          [],
+          {},
+          resp.comments
+        );
+        lastSavedSelectionKeyRef.current = EMPTY_SELECTION_SAVE_KEY;
 
         showSuccessMessage(force ? 'Comments re-generated!' : 'Comments generated!');
       }
@@ -775,40 +792,49 @@ const GradingEditor: React.FC<Props> = props => {
         </>
       )}
 
-      <div className="react-mde-parent">
-        <ReactMde
-          value={editorValue}
-          onChange={setEditorValue}
-          selectedTab={selectedTab}
-          onTabChange={onTabChange}
-          generateMarkdownPreview={generateMarkdownPreview}
-          minEditorHeight={200}
-          maxEditorHeight={1000}
-          minPreviewHeight={240}
-          getIcon={blueprintIconProvider}
+      <div
+        className="react-mde-parent"
+        style={{ border: '1px solid #d8e1e8', borderRadius: '4px' }}
+      >
+        <textarea
+          key={'single-comment-editor'}
+          value={editorText}
+          placeholder={'Write feedback for the student...'}
+          onChange={event => handleEditorTextChange(event.target.value)}
+          rows={Math.max(10, editorText.split('\n').length + 1)}
+          style={{
+            width: '100%',
+            border: 'none',
+            outline: 'none',
+            resize: 'none',
+            background: 'transparent',
+            padding: '12px',
+            fontFamily: 'inherit',
+            fontSize: '14px',
+            lineHeight: '1.5',
+            boxSizing: 'border-box'
+          }}
         />
       </div>
 
-      {selectedTab === 'write' && (
-        <div className="grading-editor-draft-buttons">
-          <div className="grading-editor-save-button">
-            <ControlButton
-              label="Save Changes"
-              icon={IconNames.FLOPPY_DISK}
-              onClick={validateXpBeforeSave(onClickSaveChanges)}
-              options={saveButtonOpts}
-            />
-          </div>
-          <div className="grading-editor-discard-button">
-            <ControlButton
-              label="Discard Changes"
-              icon={IconNames.TRASH}
-              onClick={discardChanges}
-              options={discardButtonOpts}
-            />
-          </div>
+      <div className="grading-editor-draft-buttons">
+        <div className="grading-editor-save-button">
+          <ControlButton
+            label="Save Changes"
+            icon={IconNames.FLOPPY_DISK}
+            onClick={validateXpBeforeSave(onClickSaveChanges)}
+            options={saveButtonOpts}
+          />
         </div>
-      )}
+        <div className="grading-editor-discard-button">
+          <ControlButton
+            label="Discard Changes"
+            icon={IconNames.TRASH}
+            onClick={discardChanges}
+            options={discardButtonOpts}
+          />
+        </div>
+      </div>
       <div className="grading-editor-save-continue-button">
         <ControlButton
           label="Save and Continue"
@@ -827,54 +853,6 @@ const GradingEditor: React.FC<Props> = props => {
       )}
     </div>
   );
-};
-
-const mdeToBlueprintIconMap: Readonly<Record<string, readonly [IconName, string?]>> = {
-  header: [IconNames.HEADER, 'Header Styles'],
-  bold: [IconNames.BOLD, 'Bold'],
-  italic: [IconNames.ITALIC, 'Italic'],
-  strikethrough: [IconNames.STRIKETHROUGH, 'Strikethrough'],
-  link: [IconNames.LINK, 'Link'],
-  quote: [IconNames.CITATION, 'Quote'],
-  code: [IconNames.CODE, 'Monospaced'],
-  image: [IconNames.MEDIA, 'Image'],
-  'unordered-list': [IconNames.UNGROUP_OBJECTS, 'Bullets'],
-  'ordered-list': [IconNames.NUMBERED_LIST, 'Numbering'],
-  'checked-list': [IconNames.SQUARE, 'Checkboxes']
-} as const;
-
-/**
- * Maps react-mde icon names to blueprintjs counterparts
- * to reduce the number of dependencies on icons and
- * keep a more consistent look
- *
- * Also, generate a HTML title for the icon to be shown on mouse hover
- *
- * By default, react-mde would use FontAwesome5 icons if this
- * icon mapping is not provided
- */
-const mdeToBlueprintIconMapping = (name: string): { iconName: IconName; title?: string } => {
-  switch (name) {
-    case 'header':
-    case 'bold':
-    case 'italic':
-    case 'strikethrough':
-    case 'link':
-    case 'quote':
-    case 'code':
-    case 'image':
-    case 'unordered-list':
-    case 'ordered-list':
-    case 'checked-list': {
-      const [iconName, title] = mdeToBlueprintIconMap[name];
-      return { iconName, title };
-    }
-    default:
-      // For unknown icons, a question mark icon is returned
-      return {
-        iconName: IconNames.HELP
-      };
-  }
 };
 
 export default GradingEditor;

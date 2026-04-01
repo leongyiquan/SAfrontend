@@ -48,6 +48,19 @@ const getQuestionTotalTokens = (question: LLMQuestionStat): number => {
   return (question.llm_total_input_tokens || 0) + (question.llm_total_output_tokens || 0);
 };
 
+const escapeCsvField = (field: string | number | null | undefined): string => {
+  if (field === null || field === undefined) {
+    return '';
+  }
+
+  const str = String(field);
+  if (str.includes(',') || str.includes('"') || str.includes('\n') || str.includes('\r')) {
+    return `"${str.replace(/"/g, '""')}"`;
+  }
+
+  return str;
+};
+
 const LLMStatsTab: React.FC = () => {
   const { accessToken, refreshToken } = useTokens();
   const [loading, setLoading] = useState(false);
@@ -159,7 +172,9 @@ const LLMStatsTab: React.FC = () => {
             getTotalTokens(assessment).toString(),
             Number(assessment.llm_total_cost || 0).toFixed(6),
             assessment.avg_rating?.toString() ?? ''
-          ].join(',')
+          ]
+            .map(escapeCsvField)
+            .join(',')
         );
       } else {
         assessment.questions.forEach(question => {
@@ -174,13 +189,15 @@ const LLMStatsTab: React.FC = () => {
               getQuestionTotalTokens(question).toString(),
               Number(question.llm_total_cost || 0).toFixed(6),
               question.avg_rating?.toString() ?? ''
-            ].join(',')
+            ]
+              .map(escapeCsvField)
+              .join(',')
           );
         });
       }
     });
 
-    const content = [headers.join(','), ...rows].join('\n');
+    const content = [headers.map(escapeCsvField).join(','), ...rows].join('\n');
     const blob = new Blob([content], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
